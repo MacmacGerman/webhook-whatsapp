@@ -1,18 +1,17 @@
-FROM node:20-slim
+FROM node:20-bookworm-slim
 
-# Instalar dependencias necesarias para Chromium/Baileys si fuera requerido
+WORKDIR /app
+
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-
 COPY package*.json ./
-RUN npm install --production
+RUN npm install
 
 COPY . .
 
-ENV PORT=3005
 EXPOSE 3005
 
 CMD ["node", "server.js"]
+
