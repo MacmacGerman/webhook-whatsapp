@@ -26,7 +26,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3005;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://mfjtugukizpdmnzkjutn.supabase.co';
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1manR1Z3VraXpwZG1uemtqdXRuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4ODcxODIzNywiZXhwIjoyMTA0Mjk0MjM3fQ.U72oRuO9VsZKdrtA-O6DGa_0-DXBNIaRa6MRB8zaYfw';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 

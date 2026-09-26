@@ -1,4 +1,4 @@
-FROM node:20-bookworm-slim
+FROM node:22-bookworm-slim
 
 WORKDIR /app
 
@@ -14,4 +14,5 @@ COPY . .
 EXPOSE 3005
 
 CMD ["node", "server.js"]
+
 
