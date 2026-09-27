@@ -313,8 +313,13 @@ app.post('/api/instance/:orgId/logout', async (req, res) => {
     return res.json({ success: true, status: 'DISCONNECTED' });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, '0.0.0.0', async () => {
     console.log(`=========================================`);
     console.log(`🚀 WhatsApp Baileys Engine corriendo en 0.0.0.0:${PORT}`);
     console.log(`=========================================`);
+    try {
+        await initWhatsAppSession('a1000000-0000-0000-0000-000000000001');
+    } catch (e) {
+        console.error('Error auto-iniciando sesión en boot:', e);
+    }
 });
