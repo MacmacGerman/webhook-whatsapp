@@ -68,7 +68,16 @@ app.get('/api/logs', (req, res) => {
 
 // Helper para extraer texto de cualquier formato de mensaje WhatsApp
 function extractMessageText(msg) {
-    if (!msg || !msg.message) return '';
+    if (!msg || !msg.message) return null;
+
+    // Ignorar paquetes internos de protocolo y cifrado
+    if (msg.message.protocolMessage || 
+        msg.message.senderKeyDistributionMessage || 
+        msg.message.fastRatchetKeyDistributionMessage ||
+        msg.message.keyExchangeMessage) {
+        return null;
+    }
+
     const m = msg.message.ephemeralMessage?.message ||
               msg.message.viewOnceMessage?.message ||
               msg.message.viewOnceMessageV2?.message ||
@@ -80,14 +89,16 @@ function extractMessageText(msg) {
            m?.imageMessage?.caption ||
            m?.videoMessage?.caption ||
            m?.documentMessage?.caption ||
+           m?.templateMessage?.hydratedTemplate?.hydratedContentText ||
            m?.templateButtonReplyMessage?.selectedDisplayText ||
            m?.buttonsResponseMessage?.selectedDisplayText ||
            m?.listResponseMessage?.title ||
+           m?.interactiveMessage?.body?.text ||
            (m?.imageMessage ? '[Imagen]' : '') ||
            (m?.videoMessage ? '[Video]' : '') ||
            (m?.audioMessage ? '[Audio]' : '') ||
            (m?.documentMessage ? '[Documento]' : '') ||
-           '[Mensaje WhatsApp]';
+           null;
 }
 
 async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001') {
@@ -111,9 +122,7 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
         browser: ['Webhook CRM SaaS', 'Chrome', '1.0.0'],
         syncFullHistory: false,
         generateHighQualityLinkPreview: true,
-        getMessage: async (key) => {
-            return undefined;
-        }
+        getMessage: async () => undefined
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -186,11 +195,17 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
             if (!from || from.includes('@g.us') || from === 'status@broadcast') continue;
 
             const isFromMe = Boolean(msg.key?.fromMe);
-            const phone = from.replace(/[^0-9]/g, '');
+            let phone = from.replace(/[^0-9]/g, '');
+            if (msg.key?.participant) {
+                const partPhone = msg.key.participant.replace(/[^0-9]/g, '');
+                if (partPhone && partPhone.length <= 15) phone = partPhone;
+            }
             if (!phone) continue;
 
-            const senderName = msg.pushName || (isFromMe ? 'Agente' : `Cliente (+${phone.slice(-4)})`);
             const text = extractMessageText(msg);
+            if (!text) continue; // Ignorar paquetes que no tienen texto de chat
+
+            const senderName = msg.verifiedBizName || msg.pushName || (isFromMe ? 'Agente' : `+${phone}`);
             const myPhone = sock.user?.id ? `+${sock.user.id.split(':')[0]}` : '+56994340066';
 
             logEvent('message.received', { from, phone, isFromMe, senderName, text });
@@ -200,7 +215,7 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
                 let leadId = null;
                 const { data: existingLead, error: leadFindErr } = await supabase
                     .from('leads')
-                    .select('id, estado, comentarios')
+                    .select('id, nombre, estado, comentarios')
                     .eq('organizacion_id', orgId)
                     .or(`telefono.ilike.%${phone.slice(-8)}%,telefono.eq.+${phone}`)
                     .limit(1)
@@ -212,11 +227,17 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
 
                 if (existingLead) {
                     leadId = existingLead.id;
-                    const { error: leadUpErr } = await supabase.from('leads').update({
+                    const updatePayload = {
                         comentarios: text,
                         metadata: { last_message: text },
                         updated_at: new Date().toISOString()
-                    }).eq('id', existingLead.id);
+                    };
+                    // Si llega un nombre real de perfil o el lead tenía nombre genérico, actualizarlo
+                    if ((msg.verifiedBizName || msg.pushName) && (!existingLead.nombre || existingLead.nombre.startsWith('Cliente') || existingLead.nombre.startsWith('Contacto') || existingLead.nombre.startsWith('Prospecto') || existingLead.nombre.startsWith('+'))) {
+                        updatePayload.nombre = msg.verifiedBizName || msg.pushName;
+                    }
+
+                    const { error: leadUpErr } = await supabase.from('leads').update(updatePayload).eq('id', existingLead.id);
                     if (leadUpErr) logEvent('lead.update.error', { error: leadUpErr.message });
                 } else if (!isFromMe) {
                     // Auto-crear Lead si es entrante nuevo
