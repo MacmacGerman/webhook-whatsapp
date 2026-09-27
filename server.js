@@ -46,6 +46,30 @@ app.get('/health', (req, res) => {
     return res.status(200).send('OK');
 });
 
+// Helper para extraer texto de cualquier formato de mensaje WhatsApp
+function extractMessageText(msg) {
+    if (!msg || !msg.message) return '';
+    const m = msg.message.ephemeralMessage?.message ||
+              msg.message.viewOnceMessage?.message ||
+              msg.message.viewOnceMessageV2?.message ||
+              msg.message.documentWithCaptionMessage?.message ||
+              msg.message;
+
+    return m?.conversation ||
+           m?.extendedTextMessage?.text ||
+           m?.imageMessage?.caption ||
+           m?.videoMessage?.caption ||
+           m?.documentMessage?.caption ||
+           m?.templateButtonReplyMessage?.selectedDisplayText ||
+           m?.buttonsResponseMessage?.selectedDisplayText ||
+           m?.listResponseMessage?.title ||
+           (m?.imageMessage ? '[Imagen]' : '') ||
+           (m?.videoMessage ? '[Video]' : '') ||
+           (m?.audioMessage ? '[Audio]' : '') ||
+           (m?.documentMessage ? '[Documento]' : '') ||
+           '[Mensaje WhatsApp]';
+}
+
 async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001') {
     if (sessions.has(orgId)) {
         return sessions.get(orgId);
@@ -126,64 +150,69 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
         }
     });
 
-    // Escuchar mensajes entrantes en tiempo real
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return;
+    // Escuchar mensajes en tiempo real (entrantes y salientes)
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        for (const msg of (messages || [])) {
+            if (!msg || !msg.message) continue;
 
-        for (const msg of messages) {
-            if (!msg.message || msg.key.fromMe) continue;
+            const from = msg.key?.remoteJid;
+            if (!from || from.includes('@g.us') || from === 'status@broadcast') continue;
 
-            const from = msg.key.remoteJid;
-            if (!from || from.includes('@g.us')) continue; // ignorar grupos por ahora
-
+            const isFromMe = Boolean(msg.key?.fromMe);
             const phone = from.replace(/[^0-9]/g, '');
-            const senderName = msg.pushName || `Cliente WhatsApp (${phone.slice(-4)})`;
-            const text = msg.message?.conversation || 
-                         msg.message?.extendedTextMessage?.text || 
-                         msg.message?.imageMessage?.caption || 
-                         '[Archivo / Multimedia]';
+            if (!phone) continue;
 
-            console.log(`[WhatsApp ${orgId}] 💬 Mensaje entrante de ${senderName} (+${phone}): ${text}`);
+            const senderName = msg.pushName || (isFromMe ? 'Agente' : `Cliente (+${phone.slice(-4)})`);
+            const text = extractMessageText(msg);
+            const myPhone = sock.user?.id ? `+${sock.user.id.split(':')[0]}` : '+56994340066';
+
+            console.log(`[WhatsApp ${orgId}] 💬 Mensaje ${isFromMe ? 'Saliente' : 'Entrante'} de/hacia ${senderName} (+${phone}): ${text}`);
 
             try {
-                // 1. Guardar mensaje en whatsapp_messages
-                await supabase.from('whatsapp_messages').insert({
-                    organizacion_id: orgId,
-                    phone: `+${phone}`,
-                    sender_name: senderName,
-                    message_text: text,
-                    direction: 'inbound',
-                    status: 'received',
-                    raw_payload: msg
-                });
-
-                // 2. Verificar o crear Lead en leads
+                // 1. Buscar Lead existente por teléfono
+                let leadId = null;
                 const { data: existingLead } = await supabase
                     .from('leads')
-                    .select('id, estado')
+                    .select('id, estado, comentarios')
                     .eq('organizacion_id', orgId)
-                    .ilike('telefono', `%${phone.slice(-8)}%`)
+                    .or(`telefono.ilike.%${phone.slice(-8)}%,telefono.eq.+${phone}`)
+                    .limit(1)
                     .maybeSingle();
 
                 if (existingLead) {
+                    leadId = existingLead.id;
                     await supabase.from('leads').update({
-                        last_message: text,
+                        comentarios: text,
+                        metadata: { last_message: text },
                         updated_at: new Date().toISOString()
                     }).eq('id', existingLead.id);
-                } else {
-                    await supabase.from('leads').insert({
+                } else if (!isFromMe) {
+                    // Auto-crear Lead si es entrante nuevo
+                    const { data: newLead } = await supabase.from('leads').insert({
                         organizacion_id: orgId,
                         nombre: senderName,
                         telefono: `+${phone}`,
-                        estado: 'NUEVO_LEAD',
-                        origen: 'WhatsApp QR',
-                        last_message: text,
-                        prioridad: 'MEDIA'
-                    });
+                        estado: 'BANDEJA DE ENTRADA',
+                        fuente: 'WhatsApp Directo',
+                        comentarios: text,
+                        metadata: { last_message: text }
+                    }).select('id').single();
+                    if (newLead) leadId = newLead.id;
                     console.log(`[WhatsApp ${orgId}] 🎯 Nuevo Lead auto-creado en Kanban: ${senderName}`);
                 }
+
+                // 2. Guardar mensaje en whatsapp_messages
+                await supabase.from('whatsapp_messages').insert({
+                    organizacion_id: orgId,
+                    lead_id: leadId,
+                    sender: isFromMe ? myPhone : `+${phone}`,
+                    receiver: isFromMe ? `+${phone}` : myPhone,
+                    message_text: text,
+                    direction: isFromMe ? 'outbound' : 'inbound',
+                    status: isFromMe ? 'sent' : 'received'
+                });
             } catch (err) {
-                console.error(`[WhatsApp ${orgId}] Error procesando mensaje entrante:`, err);
+                console.error(`[WhatsApp ${orgId}] Error procesando mensaje:`, err);
             }
         }
     });
@@ -236,19 +265,31 @@ app.post('/api/instance/:orgId/send', async (req, res) => {
         const jid = `${cleanPhone}@s.whatsapp.net`;
 
         const sent = await sock.sendMessage(jid, { text: message });
+        const myPhone = sock.user?.id ? `+${sock.user.id.split(':')[0]}` : '+56994340066';
+
+        // Buscar Lead para vincular
+        let leadId = null;
+        const { data: leadData } = await supabase
+            .from('leads')
+            .select('id')
+            .eq('organizacion_id', orgId)
+            .or(`telefono.ilike.%${cleanPhone.slice(-8)}%,telefono.eq.+${cleanPhone}`)
+            .limit(1)
+            .maybeSingle();
+        if (leadData) leadId = leadData.id;
 
         // Guardar mensaje saliente en Supabase
         await supabase.from('whatsapp_messages').insert({
             organizacion_id: orgId,
-            phone: `+${cleanPhone}`,
-            sender_name: 'Agente CRM',
+            lead_id: leadId,
+            sender: myPhone,
+            receiver: `+${cleanPhone}`,
             message_text: message,
             direction: 'outbound',
-            status: 'sent',
-            raw_payload: sent
+            status: 'sent'
         });
 
-        return res.json({ success: true, messageId: sent.key.id });
+        return res.json({ success: true, messageId: sent.key?.id });
     } catch (err) {
         console.error('Error enviando mensaje:', err);
         return res.status(500).json({ error: err.message });
