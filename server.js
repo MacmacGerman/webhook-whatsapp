@@ -34,6 +34,14 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const sessions = new Map();
 const qrCodes = new Map();
 const sessionStatuses = new Map();
+const recentLogs = [];
+
+function logEvent(type, data) {
+    const entry = { time: new Date().toISOString(), type, data };
+    recentLogs.unshift(entry);
+    if (recentLogs.length > 50) recentLogs.pop();
+    console.log(`[${entry.time}] [${type}]`, typeof data === 'object' ? JSON.stringify(data) : data);
+}
 
 const logger = pino({ level: 'silent' });
 
@@ -44,6 +52,18 @@ app.get('/', (req, res) => {
 
 app.get('/health', (req, res) => {
     return res.status(200).send('OK');
+});
+
+app.get('/api/logs', (req, res) => {
+    return res.json({
+        total: recentLogs.length,
+        logs: recentLogs,
+        sessions: Array.from(sessions.keys()).map(k => ({
+            orgId: k,
+            status: sessionStatuses.get(k),
+            user: sessions.get(k)?.user
+        }))
+    });
 });
 
 // Helper para extraer texto de cualquier formato de mensaje WhatsApp
@@ -91,12 +111,16 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
         browser: ['Webhook CRM SaaS', 'Chrome', '1.0.0'],
         syncFullHistory: false,
         generateHighQualityLinkPreview: true,
+        getMessage: async (key) => {
+            return undefined;
+        }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
+        logEvent('connection.update', { connection, qr: Boolean(qr), statusCode: (lastDisconnect?.error)?.output?.statusCode });
 
         if (qr) {
             try {
@@ -136,6 +160,7 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
 
             const userJid = sock.user?.id || '';
             const phone = userJid.split(':')[0] || userJid.split('@')[0];
+            logEvent('connection.open', { phone, userJid });
 
             // Actualizar en Supabase
             try {
@@ -151,7 +176,9 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
     });
 
     // Escuchar mensajes en tiempo real (entrantes y salientes)
-    sock.ev.on('messages.upsert', async ({ messages }) => {
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        logEvent('messages.upsert', { type, count: messages?.length });
+
         for (const msg of (messages || [])) {
             if (!msg || !msg.message) continue;
 
@@ -166,12 +193,12 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
             const text = extractMessageText(msg);
             const myPhone = sock.user?.id ? `+${sock.user.id.split(':')[0]}` : '+56994340066';
 
-            console.log(`[WhatsApp ${orgId}] 💬 Mensaje ${isFromMe ? 'Saliente' : 'Entrante'} de/hacia ${senderName} (+${phone}): ${text}`);
+            logEvent('message.received', { from, phone, isFromMe, senderName, text });
 
             try {
                 // 1. Buscar Lead existente por teléfono
                 let leadId = null;
-                const { data: existingLead } = await supabase
+                const { data: existingLead, error: leadFindErr } = await supabase
                     .from('leads')
                     .select('id, estado, comentarios')
                     .eq('organizacion_id', orgId)
@@ -179,16 +206,21 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
                     .limit(1)
                     .maybeSingle();
 
+                if (leadFindErr) {
+                    logEvent('lead.find.error', { error: leadFindErr.message });
+                }
+
                 if (existingLead) {
                     leadId = existingLead.id;
-                    await supabase.from('leads').update({
+                    const { error: leadUpErr } = await supabase.from('leads').update({
                         comentarios: text,
                         metadata: { last_message: text },
                         updated_at: new Date().toISOString()
                     }).eq('id', existingLead.id);
+                    if (leadUpErr) logEvent('lead.update.error', { error: leadUpErr.message });
                 } else if (!isFromMe) {
                     // Auto-crear Lead si es entrante nuevo
-                    const { data: newLead } = await supabase.from('leads').insert({
+                    const { data: newLead, error: leadInsErr } = await supabase.from('leads').insert({
                         organizacion_id: orgId,
                         nombre: senderName,
                         telefono: `+${phone}`,
@@ -197,12 +229,17 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
                         comentarios: text,
                         metadata: { last_message: text }
                     }).select('id').single();
-                    if (newLead) leadId = newLead.id;
-                    console.log(`[WhatsApp ${orgId}] 🎯 Nuevo Lead auto-creado en Kanban: ${senderName}`);
+
+                    if (leadInsErr) {
+                        logEvent('lead.insert.error', { error: leadInsErr.message });
+                    } else if (newLead) {
+                        leadId = newLead.id;
+                        logEvent('lead.created', { id: leadId, nombre: senderName });
+                    }
                 }
 
                 // 2. Guardar mensaje en whatsapp_messages
-                await supabase.from('whatsapp_messages').insert({
+                const { data: msgData, error: msgInsErr } = await supabase.from('whatsapp_messages').insert({
                     organizacion_id: orgId,
                     lead_id: leadId,
                     sender: isFromMe ? myPhone : `+${phone}`,
@@ -210,8 +247,15 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
                     message_text: text,
                     direction: isFromMe ? 'outbound' : 'inbound',
                     status: isFromMe ? 'sent' : 'received'
-                });
+                }).select('id');
+
+                if (msgInsErr) {
+                    logEvent('msg.insert.error', { error: msgInsErr.message });
+                } else {
+                    logEvent('msg.inserted', { id: msgData?.[0]?.id, text });
+                }
             } catch (err) {
+                logEvent('message.process.exception', { error: err.message });
                 console.error(`[WhatsApp ${orgId}] Error procesando mensaje:`, err);
             }
         }
