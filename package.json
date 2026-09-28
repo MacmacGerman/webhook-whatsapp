@@ -1,6 +1,6 @@
 {
   "name": "webhook-whatsapp-engine",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "WhatsApp Baileys Realtime Engine for Webhook SaaS CRM",
   "main": "server.js",
   "type": "module",

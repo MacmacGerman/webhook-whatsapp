@@ -34,7 +34,49 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const sessions = new Map();
 const qrCodes = new Map();
 const sessionStatuses = new Map();
+const reconnectAttempts = new Map();
+const sendQueues = new Map();
 const recentLogs = [];
+
+// Helper para cola de envío con retardo humano (Anti-Ban / Rate Limiting)
+async function enqueueOutboundSend(orgId, sendFn) {
+    if (!sendQueues.has(orgId)) {
+        sendQueues.set(orgId, Promise.resolve());
+    }
+    const previous = sendQueues.get(orgId);
+    const current = previous.then(async () => {
+        const result = await sendFn();
+        // Pausa aleatoria entre mensajes consecutivos (1.5s a 3.5s)
+        const jitter = 1500 + Math.floor(Math.random() * 2000);
+        await new Promise(r => setTimeout(r, jitter));
+        return result;
+    });
+    sendQueues.set(orgId, current.catch(() => {}));
+    return current;
+}
+
+// Mapeo bidireccional LID <-> Teléfono Real
+const lidToPhoneMap = new Map();
+const phoneToLidMap = new Map();
+
+function getValidOrgUuid(id) {
+    if (!id) return 'a1000000-0000-0000-0000-000000000001';
+    const match = String(id).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    return match ? match[0] : 'a1000000-0000-0000-0000-000000000001';
+}
+
+function registerContact(c) {
+    if (!c) return;
+    const phoneJid = c.id || '';
+    const lidJid = c.lid || '';
+    const cleanPhone = phoneJid.includes('@s.whatsapp.net') ? phoneJid.replace(/[^0-9]/g, '') : '';
+    const cleanLid = lidJid.includes('@lid') ? lidJid.replace(/[^0-9]/g, '') : (phoneJid.includes('@lid') ? phoneJid.replace(/[^0-9]/g, '') : '');
+    
+    if (cleanPhone && cleanLid && cleanPhone !== cleanLid) {
+        lidToPhoneMap.set(cleanLid, cleanPhone);
+        phoneToLidMap.set(cleanPhone, cleanLid);
+    }
+}
 
 function logEvent(type, data) {
     const entry = { time: new Date().toISOString(), type, data };
@@ -101,12 +143,56 @@ function extractMessageText(msg) {
            null;
 }
 
-async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001') {
-    if (sessions.has(orgId)) {
+// Helper para normalizar números de teléfono (ej. Chile 9XXXXXXXX -> 569XXXXXXXX)
+function normalizePhoneNumber(phone) {
+    if (!phone) return '';
+    let clean = String(phone).replace(/[^0-9]/g, '');
+    if (clean.length === 9 && clean.startsWith('9')) {
+        clean = '56' + clean;
+    } else if (clean.length === 8) {
+        clean = '569' + clean;
+    }
+    return clean;
+}
+
+function cleanSessionFolder(dirPath) {
+    if (!fs.existsSync(dirPath)) return;
+    try {
+        const files = fs.readdirSync(dirPath);
+        for (const file of files) {
+            const filePath = path.join(dirPath, file);
+            try {
+                if (fs.statSync(filePath).isDirectory()) {
+                    cleanSessionFolder(filePath);
+                    try { fs.rmdirSync(filePath); } catch (e) {}
+                } else {
+                    fs.unlinkSync(filePath);
+                }
+            } catch (e) {}
+        }
+    } catch (e) {}
+}
+
+async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001', forceNew = false) {
+    if (!forceNew && sessions.has(orgId) && sessionStatuses.get(orgId) === 'CONNECTED') {
         return sessions.get(orgId);
     }
 
+    // Limpiar socket anterior si existía
+    if (sessions.has(orgId)) {
+        const oldSock = sessions.get(orgId);
+        try { oldSock.end(undefined); } catch (e) {}
+        sessions.delete(orgId);
+    }
+
+    sessionStatuses.set(orgId, 'INITIALIZING');
+    qrCodes.delete(orgId);
+
     const sessionDir = path.resolve(__dirname, `./sessions/${orgId}`);
+    if (forceNew) {
+        cleanSessionFolder(sessionDir);
+    }
+
     if (!fs.existsSync(sessionDir)) {
         fs.mkdirSync(sessionDir, { recursive: true });
     }
@@ -119,13 +205,28 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
         logger,
         printQRInTerminal: true,
         auth: state,
-        browser: ['Webhook CRM SaaS', 'Chrome', '1.0.0'],
+        browser: ['Google Chrome (Windows)', 'Chrome', '124.0.0.0'],
         syncFullHistory: false,
         generateHighQualityLinkPreview: true,
         getMessage: async () => undefined
     });
 
+    sessions.set(orgId, sock);
+
     sock.ev.on('creds.update', saveCreds);
+
+    // Sincronizar Contactos y Mapear LIDs a teléfonos reales
+    sock.ev.on('contacts.upsert', (contacts) => {
+        for (const c of (contacts || [])) registerContact(c);
+    });
+
+    sock.ev.on('contacts.update', (updates) => {
+        for (const c of (updates || [])) registerContact(c);
+    });
+
+    sock.ev.on('messaging-history.set', ({ contacts }) => {
+        for (const c of (contacts || [])) registerContact(c);
+    });
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
@@ -136,7 +237,7 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
                 const qrImage = await QRCode.toDataURL(qr, { scale: 8, margin: 2 });
                 qrCodes.set(orgId, qrImage);
                 sessionStatuses.set(orgId, 'QR_READY');
-                console.log(`[WhatsApp ${orgId}] 📲 Nuevo Código QR generado`);
+                console.log(`[WhatsApp ${orgId}] 📲 Nuevo Código QR generado con éxito`);
             } catch (err) {
                 console.error(`[WhatsApp ${orgId}] Error generando QR imagen:`, err);
             }
@@ -144,28 +245,41 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
 
         if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            console.log(`[WhatsApp ${orgId}] ⚠️ Conexión cerrada. Reconectar: ${shouldReconnect}, Status: ${statusCode}`);
+            const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401;
+            console.log(`[WhatsApp ${orgId}] ⚠️ Conexión cerrada. Status: ${statusCode}, isLoggedOut: ${isLoggedOut}`);
             
             sessionStatuses.set(orgId, 'DISCONNECTED');
             qrCodes.delete(orgId);
             sessions.delete(orgId);
 
+            if (isLoggedOut) {
+                // Borrar archivos de sesión para forzar nuevo QR limpio
+                cleanSessionFolder(sessionDir);
+                reconnectAttempts.delete(orgId);
+            }
+
             // Actualizar Supabase
             try {
+                const dbOrgId = getValidOrgUuid(orgId);
                 await supabase.from('organizaciones').update({
                     whatsapp_status: 'DESCONECTADO',
+                    whatsapp_phone: null,
                     updated_at: new Date().toISOString()
-                }).eq('id', orgId);
+                }).eq('id', dbOrgId);
             } catch (e) {}
 
-            if (shouldReconnect) {
-                setTimeout(() => initWhatsAppSession(orgId), 3000);
-            }
+            // Reconexión con Backoff exponencial inteligente (evita saturación y shadowban)
+            const attempts = (reconnectAttempts.get(orgId) || 0) + 1;
+            reconnectAttempts.set(orgId, attempts);
+            const delayMs = isLoggedOut ? 1500 : Math.min(attempts * 2500, 30000);
+            
+            console.log(`[WhatsApp ${orgId}] ⏳ Reintentando conexión en ${delayMs / 1000}s (Intento #${attempts})...`);
+            setTimeout(() => initWhatsAppSession(orgId, isLoggedOut), delayMs);
         } else if (connection === 'open') {
             console.log(`[WhatsApp ${orgId}] ✅ ¡Conexión establecida con éxito!`);
             sessionStatuses.set(orgId, 'CONNECTED');
             qrCodes.delete(orgId);
+            reconnectAttempts.set(orgId, 0);
 
             const userJid = sock.user?.id || '';
             const phone = userJid.split(':')[0] || userJid.split('@')[0];
@@ -173,11 +287,12 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
 
             // Actualizar en Supabase
             try {
+                const dbOrgId = getValidOrgUuid(orgId);
                 await supabase.from('organizaciones').update({
                     whatsapp_status: 'CONECTADO',
                     whatsapp_phone: `+${phone}`,
                     updated_at: new Date().toISOString()
-                }).eq('id', orgId);
+                }).eq('id', dbOrgId);
             } catch (e) {
                 console.error('Error actualizando estado en Supabase:', e);
             }
@@ -195,12 +310,20 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
             if (!from || from.includes('@g.us') || from === 'status@broadcast') continue;
 
             const isFromMe = Boolean(msg.key?.fromMe);
-            let phone = from.replace(/[^0-9]/g, '');
+            let rawId = from.replace(/[^0-9]/g, '');
             if (msg.key?.participant) {
                 const partPhone = msg.key.participant.replace(/[^0-9]/g, '');
-                if (partPhone && partPhone.length <= 15) phone = partPhone;
+                if (partPhone) rawId = partPhone;
             }
-            if (!phone) continue;
+            if (!rawId) continue;
+
+            // Resolver si rawId es un LID a su número de teléfono real
+            const isLid = from.endsWith('@lid') || rawId.length > 13;
+            let phone = rawId;
+            if (isLid && lidToPhoneMap.has(rawId)) {
+                phone = lidToPhoneMap.get(rawId);
+            }
+            phone = normalizePhoneNumber(phone);
 
             const text = extractMessageText(msg);
             if (!text) continue; // Ignorar paquetes que no tienen texto de chat
@@ -208,16 +331,27 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
             const senderName = msg.verifiedBizName || msg.pushName || (isFromMe ? 'Agente' : `+${phone}`);
             const myPhone = sock.user?.id ? `+${sock.user.id.split(':')[0]}` : '+56994340066';
 
-            logEvent('message.received', { from, phone, isFromMe, senderName, text });
+            // Simular lectura humana (Double Blue Check) tras 1.5 a 3.5s si es mensaje entrante
+            if (!isFromMe && msg.key) {
+                setTimeout(async () => {
+                    try {
+                        await sock.readMessages([msg.key]);
+                    } catch (e) {}
+                }, 1500 + Math.floor(Math.random() * 2000));
+            }
+
+            logEvent('message.received', { from, rawId, phone, isLid, isFromMe, senderName, text });
+
+            const dbOrgId = getValidOrgUuid(orgId);
 
             try {
-                // 1. Buscar Lead existente por teléfono
+                // 1. Buscar Lead existente por teléfono o JID o LID
                 let leadId = null;
                 const { data: existingLead, error: leadFindErr } = await supabase
                     .from('leads')
-                    .select('id, nombre, estado, comentarios')
-                    .eq('organizacion_id', orgId)
-                    .or(`telefono.ilike.%${phone.slice(-8)}%,telefono.eq.+${phone}`)
+                    .select('id, nombre, estado, comentarios, metadata, telefono')
+                    .eq('organizacion_id', dbOrgId)
+                    .or(`telefono.ilike.%${phone.slice(-8)}%,telefono.eq.+${phone},telefono.eq.+${rawId}`)
                     .limit(1)
                     .maybeSingle();
 
@@ -227,28 +361,48 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
 
                 if (existingLead) {
                     leadId = existingLead.id;
+                    const shouldUpdatePhone = phone !== rawId && existingLead.telefono.includes(rawId);
                     const updatePayload = {
-                        comentarios: text,
-                        metadata: { last_message: text },
+                        ...(shouldUpdatePhone ? { telefono: `+${phone}` } : {}),
+                        comentarios: isFromMe ? (existingLead.comentarios || text) : text,
+                        metadata: { 
+                            ...(existingLead.metadata || {}),
+                            jid: from, 
+                            lid: isLid ? from : (existingLead.metadata?.lid || null),
+                            last_message: text,
+                            last_message_at: new Date().toISOString(),
+                            last_message_direction: isFromMe ? 'outbound' : 'inbound',
+                            unread: !isFromMe,
+                            ...(isFromMe ? {} : { last_inbound_message: text, last_inbound_at: new Date().toISOString() })
+                        },
                         updated_at: new Date().toISOString()
                     };
-                    // Si llega un nombre real de perfil o el lead tenía nombre genérico, actualizarlo
-                    if ((msg.verifiedBizName || msg.pushName) && (!existingLead.nombre || existingLead.nombre.startsWith('Cliente') || existingLead.nombre.startsWith('Contacto') || existingLead.nombre.startsWith('Prospecto') || existingLead.nombre.startsWith('+'))) {
+
+                    if (!isFromMe && (msg.verifiedBizName || msg.pushName) && (!existingLead.nombre || existingLead.nombre.startsWith('Cliente') || existingLead.nombre.startsWith('Contacto') || existingLead.nombre.startsWith('Prospecto') || existingLead.nombre.startsWith('+'))) {
                         updatePayload.nombre = msg.verifiedBizName || msg.pushName;
                     }
 
                     const { error: leadUpErr } = await supabase.from('leads').update(updatePayload).eq('id', existingLead.id);
                     if (leadUpErr) logEvent('lead.update.error', { error: leadUpErr.message });
                 } else if (!isFromMe) {
-                    // Auto-crear Lead si es entrante nuevo
+                    // Auto-crear Lead SOLO si es mensaje entrante de un cliente nuevo
                     const { data: newLead, error: leadInsErr } = await supabase.from('leads').insert({
-                        organizacion_id: orgId,
+                        organizacion_id: dbOrgId,
                         nombre: senderName,
                         telefono: `+${phone}`,
                         estado: 'BANDEJA DE ENTRADA',
                         fuente: 'WhatsApp Directo',
                         comentarios: text,
-                        metadata: { last_message: text }
+                        metadata: { 
+                            jid: from, 
+                            lid: isLid ? from : null,
+                            last_message: text,
+                            last_inbound_message: text,
+                            last_message_at: new Date().toISOString(),
+                            last_inbound_at: new Date().toISOString(),
+                            last_message_direction: 'inbound',
+                            unread: true
+                        }
                     }).select('id').single();
 
                     if (leadInsErr) {
@@ -261,7 +415,7 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
 
                 // 2. Guardar mensaje en whatsapp_messages
                 const { data: msgData, error: msgInsErr } = await supabase.from('whatsapp_messages').insert({
-                    organizacion_id: orgId,
+                    organizacion_id: dbOrgId,
                     lead_id: leadId,
                     sender: isFromMe ? myPhone : `+${phone}`,
                     receiver: isFromMe ? `+${phone}` : myPhone,
@@ -282,7 +436,6 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
         }
     });
 
-    sessions.set(orgId, sock);
     return sock;
 }
 
@@ -292,20 +445,31 @@ async function initWhatsAppSession(orgId = 'a1000000-0000-0000-0000-000000000001
 app.get('/api/instance/:orgId/qr', async (req, res) => {
     const { orgId } = req.params;
     
-    // Iniciar sesión si no existe
-    if (!sessions.has(orgId)) {
-        await initWhatsAppSession(orgId);
+    const currentStatus = sessionStatuses.get(orgId);
+    const existingQr = qrCodes.get(orgId);
+    const existingSock = sessions.get(orgId);
+
+    // Si no está conectado y no hay QR listo, forzar inicio de sesión limpio para generar el QR
+    if (!existingSock || currentStatus === 'DISCONNECTED' || (currentStatus !== 'CONNECTED' && !existingQr)) {
+        await initWhatsAppSession(orgId, true);
+        
+        // Esperar hasta 4 segundos a que Baileys emita el código QR
+        for (let i = 0; i < 20; i++) {
+            if (qrCodes.get(orgId) || sessionStatuses.get(orgId) === 'CONNECTED') break;
+            await new Promise(r => setTimeout(r, 200));
+        }
     }
 
     const qr = qrCodes.get(orgId);
     const status = sessionStatuses.get(orgId) || 'INITIALIZING';
     const sock = sessions.get(orgId);
-    const phone = sock?.user?.id ? `+${sock.user.id.split(':')[0]}` : null;
+    const isConnected = status === 'CONNECTED';
+    const phone = (isConnected && sock?.user?.id) ? `+${sock.user.id.split(':')[0]}` : null;
 
     return res.json({
         success: true,
         orgId,
-        status,
+        status: qr ? 'QR_READY' : status,
         qrCode: qr || null,
         phone
     });
@@ -314,7 +478,7 @@ app.get('/api/instance/:orgId/qr', async (req, res) => {
 // 2. Enviar mensaje de WhatsApp
 app.post('/api/instance/:orgId/send', async (req, res) => {
     const { orgId } = req.params;
-    const { to, message } = req.body;
+    const { to, message, leadId: reqLeadId } = req.body;
 
     if (!to || !message) {
         return res.status(400).json({ error: 'Faltan parámetros (to, message)' });
@@ -326,26 +490,102 @@ app.post('/api/instance/:orgId/send', async (req, res) => {
     }
 
     try {
-        const cleanPhone = to.replace(/[^0-9]/g, '');
-        const jid = `${cleanPhone}@s.whatsapp.net`;
+        let cleanPhone = normalizePhoneNumber(to);
+        let targetJid = to.includes('@') ? to : null;
 
-        const sent = await sock.sendMessage(jid, { text: message });
+        // Si es LID largo, revisar si conocemos el teléfono real
+        if (cleanPhone.length > 13 && lidToPhoneMap.has(cleanPhone)) {
+            cleanPhone = lidToPhoneMap.get(cleanPhone);
+        }
+
+        // Buscar Lead para vincular y obtener su JID real si existe
+        let leadId = reqLeadId || null;
+        let leadData = null;
+
+        if (leadId) {
+            const { data } = await supabase
+                .from('leads')
+                .select('id, metadata, telefono')
+                .eq('id', leadId)
+                .maybeSingle();
+            leadData = data;
+        }
+
+        const dbOrgId = getValidOrgUuid(orgId);
+
+        if (!leadData) {
+            const { data } = await supabase
+                .from('leads')
+                .select('id, metadata, telefono')
+                .eq('organizacion_id', dbOrgId)
+                .or(`telefono.ilike.%${cleanPhone.slice(-8)}%,telefono.eq.+${cleanPhone}`)
+                .limit(1)
+                .maybeSingle();
+            leadData = data;
+        }
+
+        if (leadData) {
+            leadId = leadData.id;
+            if (leadData.metadata?.jid && !to.includes('@')) {
+                targetJid = leadData.metadata.jid;
+            }
+        }
+
+        if (!targetJid) {
+            if (cleanPhone.length > 13) {
+                targetJid = `${cleanPhone}@lid`;
+            } else {
+                // Validar contra servidores de WhatsApp
+                try {
+                    const results = await sock.onWhatsApp(cleanPhone);
+                    if (results && results.length > 0 && results[0]?.exists && results[0]?.jid) {
+                        targetJid = results[0].jid;
+                    } else {
+                        targetJid = `${cleanPhone}@s.whatsapp.net`;
+                    }
+                } catch (e) {
+                    targetJid = `${cleanPhone}@s.whatsapp.net`;
+                }
+            }
+        }
+
+        logEvent('message.send.attempt', { targetJid, cleanPhone, message, leadId });
+
+        // Enviar a través de la cola con simulación de comportamiento humano (Anti-Ban)
+        const sendResult = await enqueueOutboundSend(orgId, async () => {
+            // 1. Simular estado "Escribiendo..." proporcional al tamaño del mensaje (1.2s a 3.2s)
+            try {
+                await sock.sendPresenceUpdate('composing', targetJid);
+            } catch (e) {}
+
+            const typingDurationMs = Math.min(Math.max(message.length * 25, 1200), 3200);
+            await new Promise(r => setTimeout(r, typingDurationMs));
+
+            // 2. Enviar mensaje real
+            let sent;
+            try {
+                sent = await sock.sendMessage(targetJid, { text: message });
+            } catch (sendErr) {
+                console.warn(`[WhatsApp ${orgId}] Error enviando a ${targetJid}, intentando formato alternativo:`, sendErr.message);
+                const altJid = targetJid.endsWith('@lid') ? `${cleanPhone}@s.whatsapp.net` : `${cleanPhone}@lid`;
+                sent = await sock.sendMessage(altJid, { text: message });
+                targetJid = altJid;
+            }
+
+            // 3. Pausar estado de presencia
+            try {
+                await sock.sendPresenceUpdate('paused', targetJid);
+            } catch (e) {}
+
+            return sent;
+        });
+
         const myPhone = sock.user?.id ? `+${sock.user.id.split(':')[0]}` : '+56994340066';
-
-        // Buscar Lead para vincular
-        let leadId = null;
-        const { data: leadData } = await supabase
-            .from('leads')
-            .select('id')
-            .eq('organizacion_id', orgId)
-            .or(`telefono.ilike.%${cleanPhone.slice(-8)}%,telefono.eq.+${cleanPhone}`)
-            .limit(1)
-            .maybeSingle();
-        if (leadData) leadId = leadData.id;
+        logEvent('message.send.success', { targetJid, messageId: sendResult?.key?.id });
 
         // Guardar mensaje saliente en Supabase
         await supabase.from('whatsapp_messages').insert({
-            organizacion_id: orgId,
+            organizacion_id: dbOrgId,
             lead_id: leadId,
             sender: myPhone,
             receiver: `+${cleanPhone}`,
@@ -354,7 +594,22 @@ app.post('/api/instance/:orgId/send', async (req, res) => {
             status: 'sent'
         });
 
-        return res.json({ success: true, messageId: sent.key?.id });
+        // Actualizar último mensaje en el Lead y marcar como leído/respondido
+        if (leadId) {
+            await supabase.from('leads').update({
+                comentarios: message,
+                metadata: {
+                    ...(leadData?.metadata || {}),
+                    last_message: message,
+                    last_message_at: new Date().toISOString(),
+                    last_message_direction: 'outbound',
+                    unread: false
+                },
+                updated_at: new Date().toISOString()
+            }).eq('id', leadId);
+        }
+
+        return res.json({ success: true, messageId: sendResult?.key?.id });
     } catch (err) {
         console.error('Error enviando mensaje:', err);
         return res.status(500).json({ error: err.message });
@@ -367,15 +622,53 @@ app.post('/api/instance/:orgId/logout', async (req, res) => {
     const sock = sessions.get(orgId);
 
     if (sock) {
-        try {
-            await sock.logout();
-        } catch (e) {}
+        try { await sock.logout(); } catch (e) {}
+        try { sock.end(undefined); } catch (e) {}
         sessions.delete(orgId);
         qrCodes.delete(orgId);
         sessionStatuses.set(orgId, 'DISCONNECTED');
     }
 
+    const sessionDir = path.resolve(__dirname, `./sessions/${orgId}`);
+    cleanSessionFolder(sessionDir);
+
+    try {
+        const dbOrgId = getValidOrgUuid(orgId);
+        await supabase.from('organizaciones').update({
+            whatsapp_status: 'DESCONECTADO',
+            whatsapp_phone: null,
+            updated_at: new Date().toISOString()
+        }).eq('id', dbOrgId);
+    } catch (e) {}
+
+    setTimeout(() => {
+        initWhatsAppSession(orgId, true).catch(() => {});
+    }, 800);
+
     return res.json({ success: true, status: 'DISCONNECTED' });
+});
+
+// 4. Reiniciar sesión y forzar generación de nuevo QR
+app.get('/api/instance/:orgId/reset', async (req, res) => {
+    const { orgId } = req.params;
+    const sessionDir = path.resolve(__dirname, `./sessions/${orgId}`);
+    cleanSessionFolder(sessionDir);
+    sessionStatuses.set(orgId, 'DISCONNECTED');
+    qrCodes.delete(orgId);
+    if (sessions.has(orgId)) {
+        try { sessions.get(orgId).end(undefined); } catch (e) {}
+        sessions.delete(orgId);
+    }
+    await initWhatsAppSession(orgId, true);
+    for (let i = 0; i < 20; i++) {
+        if (qrCodes.get(orgId)) break;
+        await new Promise(r => setTimeout(r, 200));
+    }
+    return res.json({
+        success: true,
+        qrCode: qrCodes.get(orgId) || null,
+        status: qrCodes.get(orgId) ? 'QR_READY' : (sessionStatuses.get(orgId) || 'INITIALIZING')
+    });
 });
 
 app.listen(PORT, '0.0.0.0', async () => {
